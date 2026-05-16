@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import weakref
 from datetime import datetime
@@ -83,7 +84,10 @@ def _ensure_text(value: Any) -> str:
 def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
     """Normalize provider tool-call arguments to the expected dict shape."""
     if isinstance(args, str):
-        args = json.loads(args)
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            return None
     if isinstance(args, list):
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
@@ -113,6 +117,7 @@ class MemoryStore:
 
     def __init__(self, workspace: Path):
         self.memory_dir = ensure_dir(workspace / "memory")
+        self.history_file = self.memory_dir / "HISTORY.md"
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.episode_store = EpisodeStore(self.memory_dir)
         self._consecutive_failures = 0
@@ -124,6 +129,15 @@ class MemoryStore:
 
     def write_long_term(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
+
+    def append_history(self, content: Any) -> None:
+        """为旧集成追加一条历史记录。"""
+        text = _ensure_text(content).strip()
+        if not text:
+            return
+        previous = self.history_file.read_text(encoding="utf-8") if self.history_file.exists() else ""
+        separator = "\n" if previous and not previous.endswith("\n") else ""
+        self.history_file.write_text(f"{previous}{separator}{text}\n", encoding="utf-8")
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
@@ -150,7 +164,7 @@ class MemoryStore:
     ) -> bool:
         """
         Consolidate the provided message chunk into MEMORY.md + Episode.
-        
+
         Args:
             messages: Messages to consolidate
             provider: LLM provider for summarization
@@ -209,16 +223,42 @@ class MemoryStore:
                 logger.warning("Memory consolidation: unexpected save_memory arguments")
                 return self._fail_or_raw_archive(messages, session_id)
 
-            if "topic" not in args or "summary" not in args or "memory_update" not in args:
+            legacy_history = args.get("history_entry")
+            has_structured_summary = "topic" in args and "summary" in args
+            if (
+                "memory_update" not in args
+                or (legacy_history is None and not has_structured_summary)
+            ):
                 logger.warning("Memory consolidation: save_memory payload missing required fields")
                 return self._fail_or_raw_archive(messages, session_id)
 
-            topic = _ensure_text(args.get("topic", "")).strip()
-            summary = _ensure_text(args.get("summary", "")).strip()
             update = args.get("memory_update")
+            if update is None:
+                logger.warning("Memory consolidation: memory_update is empty")
+                return self._fail_or_raw_archive(messages, session_id)
 
-            if not topic or not summary:
-                logger.warning("Memory consolidation: topic or summary is empty")
+            if legacy_history is not None:
+                history_text = _ensure_text(legacy_history).strip()
+                if isinstance(legacy_history, dict):
+                    summary_source = legacy_history.get("summary", legacy_history)
+                    topic_source = legacy_history.get("topic", "Conversation history")
+                else:
+                    summary_source = legacy_history
+                    topic_source = args.get("topic", "Conversation history")
+                topic = _ensure_text(topic_source).strip()
+                summary = _ensure_text(summary_source).strip()
+            else:
+                history_text = ""
+                topic_source = args.get("topic")
+                summary_source = args.get("summary")
+                if topic_source is None or summary_source is None:
+                    logger.warning("Memory consolidation: topic or summary is empty")
+                    return self._fail_or_raw_archive(messages, session_id)
+                topic = _ensure_text(topic_source).strip()
+                summary = _ensure_text(summary_source).strip()
+
+            if not topic or not summary or (legacy_history is not None and not history_text):
+                logger.warning("Memory consolidation: required save_memory value is empty")
                 return self._fail_or_raw_archive(messages, session_id)
 
             consolidation_result = {
@@ -237,11 +277,11 @@ class MemoryStore:
                 consolidation_result=consolidation_result,
             )
             self.episode_store.save(episode)
+            self.append_history(legacy_history if legacy_history is not None else consolidation_result)
 
-            if update is not None:
-                update = _ensure_text(update)
-                if update != current_memory:
-                    self.write_long_term(update)
+            update = _ensure_text(update)
+            if update != current_memory:
+                self.write_long_term(update)
 
             self._consecutive_failures = 0
             logger.info(
@@ -266,6 +306,11 @@ class MemoryStore:
     def _raw_archive(self, messages: list[dict], session_id: str = "unknown") -> None:
         """Fallback: create a raw Episode without LLM summarization."""
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        raw_lines = [
+            f"[RAW] {len(messages)} messages archived without summarization",
+            self._format_messages(messages),
+        ]
+        self.append_history("\n".join(line for line in raw_lines if line))
         episode = Episode(
             episode_id=self.episode_store.generate_episode_id(),
             session_id=session_id,
@@ -331,6 +376,20 @@ class MemoryConsolidator:
         """Archive a selected message chunk into persistent memory."""
         return await self.store.consolidate(messages, self.provider, self.model, session_id)
 
+    async def _call_consolidate_messages(
+        self,
+        messages: list[dict[str, object]],
+        session_id: str,
+    ) -> bool:
+        """调用记忆整理，同时兼容旧的一参数替身函数。"""
+        try:
+            parameters = inspect.signature(self.consolidate_messages).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if len(parameters) <= 1:
+            return await self.consolidate_messages(messages)
+        return await self.consolidate_messages(messages, session_id)
+
     def pick_consolidation_boundary(
         self,
         session: Session,
@@ -379,7 +438,7 @@ class MemoryConsolidator:
         if not messages:
             return True
         for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
-            if await self.consolidate_messages(messages, session_id):
+            if await self._call_consolidate_messages(messages, session_id):
                 return True
         return True
 
@@ -436,7 +495,7 @@ class MemoryConsolidator:
                     source,
                     len(chunk),
                 )
-                if not await self.consolidate_messages(chunk, session.key):
+                if not await self._call_consolidate_messages(chunk, session.key):
                     return
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
